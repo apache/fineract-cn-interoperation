@@ -25,7 +25,7 @@ public enum InteropActionType {
     PREPARE,
     COMMIT,
     ABORT,
-    ;
+    RELEASE;
 
     public static InteropActionType[] VALUES = values();
 }

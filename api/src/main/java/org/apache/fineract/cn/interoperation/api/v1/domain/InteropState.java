@@ -25,10 +25,7 @@ public enum InteropState {
     PREPARED,
     COMMITTED,
     ABORTED,
-    ;
-
-    public static InteropState[] VALUES = values();
-
+    RELEASED;
 
     public static InteropState forAction(InteropActionType action) {
         switch (action) {
@@ -38,6 +35,8 @@ public enum InteropState {
                 return QUOTED;
             case PREPARE:
                 return PREPARED;
+            case RELEASE:
+                return RELEASED;
             case COMMIT:
                 return COMMITTED;
             case ABORT:

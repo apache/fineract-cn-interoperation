@@ -22,5 +22,5 @@ public enum InteropTransferActionType {
 
     PREPARE,
     CREATE,
-    ;
+    RELEASE;
 }

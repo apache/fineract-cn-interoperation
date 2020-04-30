@@ -24,6 +24,8 @@ import org.apache.fineract.cn.interoperation.api.v1.domain.InteropTransferAction
 import javax.validation.constraints.NotNull;
 import java.beans.Transient;
 
+import static org.apache.fineract.cn.interoperation.api.v1.domain.InteropTransferActionType.PREPARE;
+
 public class InteropTransferCommand extends InteropTransferRequestData {
 
     @NotNull
@@ -44,6 +46,15 @@ public class InteropTransferCommand extends InteropTransferRequestData {
     @Transient
     @Override
     public InteropActionType getActionType() {
-        return action == InteropTransferActionType.PREPARE ? InteropActionType.PREPARE : InteropActionType.COMMIT;
+        switch (action) {
+            case PREPARE:
+                return InteropActionType.PREPARE;
+            case CREATE:
+                return InteropActionType.COMMIT;
+            case RELEASE:
+                return InteropActionType.RELEASE;
+            default:
+                throw new RuntimeException("Unknown InteropTransferActionType: " + action);
+        }
     }
 }

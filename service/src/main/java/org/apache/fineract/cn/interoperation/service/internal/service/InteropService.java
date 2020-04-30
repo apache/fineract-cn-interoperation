@@ -24,6 +24,7 @@ import org.apache.fineract.cn.accounting.api.v1.domain.Creditor;
 import org.apache.fineract.cn.accounting.api.v1.domain.Debtor;
 import org.apache.fineract.cn.accounting.api.v1.domain.JournalEntry;
 import org.apache.fineract.cn.api.util.UserContextHolder;
+import org.apache.fineract.cn.deposit.api.v1.client.DepositAccountManager;
 import org.apache.fineract.cn.deposit.api.v1.definition.domain.Charge;
 import org.apache.fineract.cn.deposit.api.v1.definition.domain.Currency;
 import org.apache.fineract.cn.deposit.api.v1.definition.domain.ProductDefinition;
@@ -34,7 +35,18 @@ import org.apache.fineract.cn.interoperation.api.v1.domain.InteropIdentifierType
 import org.apache.fineract.cn.interoperation.api.v1.domain.InteropState;
 import org.apache.fineract.cn.interoperation.api.v1.domain.InteropStateMachine;
 import org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType;
-import org.apache.fineract.cn.interoperation.api.v1.domain.data.*;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropIdentifierCommand;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropIdentifierData;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropIdentifierDeleteCommand;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropQuoteRequestData;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropQuoteResponseData;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropRequestData;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransactionRequestData;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransactionRequestResponseData;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransferCommand;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransferRequestData;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransferResponseData;
+import org.apache.fineract.cn.interoperation.api.v1.domain.data.MoneyData;
 import org.apache.fineract.cn.interoperation.api.v1.util.MathUtil;
 import org.apache.fineract.cn.interoperation.service.ServiceConstants;
 import org.apache.fineract.cn.interoperation.service.internal.repository.InteropActionEntity;
@@ -65,8 +77,22 @@ import java.math.MathContext;
 import java.time.Clock;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+
+import static java.math.BigDecimal.ZERO;
+import static java.util.Comparator.comparing;
+import static org.apache.fineract.cn.deposit.api.v1.EventConstants.PRODUCT_INSTANCE_TRANSACTION;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.InteropActionType.COMMIT;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.InteropActionType.PREPARE;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.InteropActionType.QUOTE;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.InteropActionType.RELEASE;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType.CURRENCY_DEPOSIT;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType.CURRENCY_WITHDRAWAL;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType.FEES_PAYMENT;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType.REIMBURSEMENT;
+import static org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropRequestData.IDENTIFIER_SEPARATOR;
 
 //import static org.apache.fineract.cn.interoperation.api.v1.util.InteroperationUtil.DEFAULT_ROUTING_CODE;
 
@@ -80,9 +106,9 @@ public class InteropService {
     private final InteropIdentifierRepository identifierRepository;
     private final InteropTransactionRepository transactionRepository;
     private final InteropActionRepository actionRepository;
-
     private final InteropDepositService depositService;
     private final InteropAccountingService accountingService;
+    private final DepositAccountManager depositAccountManager;
 
 
     @Autowired
@@ -91,13 +117,15 @@ public class InteropService {
                           InteropTransactionRepository interopTransactionRepository,
                           InteropActionRepository interopActionRepository,
                           InteropDepositService interopDepositService,
-                          InteropAccountingService interopAccountingService) {
+                          InteropAccountingService interopAccountingService,
+                          DepositAccountManager depositAccountManager) {
         this.logger = logger;
         this.identifierRepository = interopIdentifierRepository;
         this.transactionRepository = interopTransactionRepository;
         this.actionRepository = interopActionRepository;
         this.depositService = interopDepositService;
         this.accountingService = interopAccountingService;
+        this.depositAccountManager = depositAccountManager;
     }
 
     @NotNull
@@ -151,14 +179,13 @@ public class InteropService {
         return InteropTransactionRequestResponseData.build(transactionCode, action.getState(), action.getExpirationDate(), requestCode);
     }
 
-    @NotNull
     @Transactional(propagation = Propagation.MANDATORY)
     public InteropTransactionRequestResponseData createTransactionRequest(@NotNull InteropTransactionRequestData request) {
         // only when Payee request transaction from Payer, so here role must be always Payer
         //TODO: error handling
         AccountWrapper accountWrapper = validateAndGetAccount(request);
         //TODO: transaction expiration separated from action expiration
-        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper);
+        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, getNow());
         InteropActionEntity action = addAction(transaction, request);
 
         transactionRepository.save(transaction);
@@ -177,359 +204,267 @@ public class InteropService {
                 MoneyData.build(action.getFee(), currency), MoneyData.build(action.getCommission(), currency));
     }
 
-    @NotNull
     @Transactional(propagation = Propagation.MANDATORY)
     public InteropQuoteResponseData createQuote(@NotNull InteropQuoteRequestData request) {
-        //TODO: error handling
         AccountWrapper accountWrapper = validateAndGetAccount(request);
-        //TODO: transaction expiration separated from action expiration
-        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper);
+        BigDecimal calculatedFee = ZERO;
 
-        TransactionType transactionType = request.getTransactionRole().getTransactionType();
-        String accountId = accountWrapper.account.getIdentifier();
-        List<Charge> charges = depositService.getCharges(accountId, transactionType);
+        if(request.getTransactionRole().isWithdraw()) {
+            BigDecimal transferAmount = request.getAmount().getAmount();
+            TransactionType transactionType = request.getTransactionRole().getTransactionType();
+            List<Charge> charges = depositService.getCharges(accountWrapper.account.getIdentifier(), transactionType);
+            calculatedFee = MathUtil.normalize(calcTotalCharges(charges, transferAmount), MathUtil.DEFAULT_MATH_CONTEXT);
+            double calculatedTotal = transferAmount.add(calculatedFee).doubleValue();
 
-        BigDecimal amount = request.getAmount().getAmount();
-        BigDecimal fee = MathUtil.normalize(calcTotalCharges(charges, amount), MathUtil.DEFAULT_MATH_CONTEXT);
+            Double withdrawableBalance = getWithdrawableBalance(accountWrapper.account, accountWrapper.productDefinition);
+            if(withdrawableBalance < calculatedTotal) {
+                throw new UnsupportedOperationException("Not enough balance amount: " + withdrawableBalance + " < " + calculatedTotal);
+            }
+        }
 
-        Double withdrawableBalance = getWithdrawableBalance(accountWrapper.account, accountWrapper.productDefinition);
-        boolean withdraw = request.getTransactionRole().isWithdraw();
+        LocalDateTime now = getNow();
+        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, now);
+        if(transaction.getCreatedOn().equals(now)) {
+            InteropActionEntity action = addAction(transaction, request);
+            action.setFee(calculatedFee);
+            transactionRepository.save(transaction);
+            logger.info("New quote request {} saved", request.getQuoteCode());
+        }
 
-        BigDecimal total = MathUtil.nullToZero(withdraw ? MathUtil.add(amount, fee) : fee);
-        if (withdraw && withdrawableBalance < total.doubleValue())
-            throw new UnsupportedOperationException("Account balance is not enough to pay the fee " + accountId);
-
-        // TODO add action and set the status to failed in separated transaction
-        InteropActionEntity action = addAction(transaction, request);
-        action.setFee(fee);
-        // TODO: extend Charge with a property that could be stored in charges
-
-        transactionRepository.save(transaction);
-
-        InteropQuoteResponseData build = InteropQuoteResponseData.build(request.getTransactionCode(), action.getState(),
-                action.getExpirationDate(), request.getExtensionList(), request.getQuoteCode(),
-                MoneyData.build(fee, accountWrapper.productDefinition.getCurrency()), null);
-        return build;
+        InteropActionEntity lastAction = getLastAction(transaction);
+        return InteropQuoteResponseData.build(request.getTransactionCode(), lastAction.getState(),
+                lastAction.getExpirationDate(), request.getExtensionList(), request.getQuoteCode(),
+                MoneyData.build(calculatedFee, accountWrapper.productDefinition.getCurrency()), null);
     }
 
     public InteropTransferResponseData getTransfer(@NotNull String transactionCode, @NotNull String transferCode) {
-        InteropActionEntity action = validateAndGetAction(transactionCode, calcActionIdentifier(transferCode, InteropActionType.PREPARE),
-                InteropActionType.PREPARE, false);
+        InteropActionEntity action = validateAndGetAction(transactionCode, calcActionIdentifier(transferCode, PREPARE),
+                PREPARE, false);
         if (action == null)
-            action = validateAndGetAction(transactionCode, calcActionIdentifier(transferCode, InteropActionType.COMMIT),
-                    InteropActionType.COMMIT);
+            action = validateAndGetAction(transactionCode, calcActionIdentifier(transferCode, COMMIT),
+                    COMMIT);
 
         return InteropTransferResponseData.build(transactionCode, action.getState(), action.getExpirationDate(), transferCode, action.getCreatedOn());
     }
 
-    @NotNull
     @Transactional(propagation = Propagation.MANDATORY)
     public InteropTransferResponseData prepareTransfer(@NotNull InteropTransferCommand request) {
-        //TODO: error handling
-        //TODO: ABORT
         AccountWrapper accountWrapper = validateAndGetAccount(request);
-
-        LocalDateTime transactionDate = getNow();
-        //TODO: transaction expiration separated from action expiration
-        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, transactionDate, true);
-
-        validateTransfer(request, accountWrapper);
-
         TransactionType transactionType = request.getTransactionRole().getTransactionType();
+        BigDecimal transferAmount = request.getAmount().getAmount();
         List<Charge> charges = depositService.getCharges(accountWrapper.account.getIdentifier(), transactionType);
+        BigDecimal calculatedFee = MathUtil.normalize(calcTotalCharges(charges, transferAmount), MathUtil.DEFAULT_MATH_CONTEXT);
+        BigDecimal calculatedTotal = transferAmount.add(calculatedFee);
+        BigDecimal transferTotal = validateTransferAmount(request, accountWrapper);
 
-        // TODO add action and set the status to failed in separated transaction
-        InteropActionEntity action = addAction(transaction, request, transactionDate);
-        MoneyData fee = request.getFspFee();
-        action.setFee(fee == null ? null : fee.getAmount());
-        // TODO: extend Charge with a property that could be stored in charges
-
-        prepareTransfer(request, accountWrapper, action, charges, transactionDate);
-
-        transactionRepository.save(transaction);
-
-        return InteropTransferResponseData.build(request.getTransferCode(), action.getState(), action.getExpirationDate(),
-                request.getExtensionList(), request.getTransferCode(), transactionDate);
-    }
-
-    @NotNull
-    @Transactional(propagation = Propagation.MANDATORY)
-    public InteropTransferResponseData commitTransfer(@NotNull InteropTransferCommand request) {
-        //TODO: error handling
-        //TODO: ABORT
-        AccountWrapper accountWrapper = validateAndGetAccount(request);
-
-        LocalDateTime transactionDate = getNow();
-        //TODO: transaction expiration separated from action expiration
-        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, transactionDate, true);
-        transaction.setTransactionDate(transactionDate);
-
-        validateTransfer(request, accountWrapper);
-
-        TransactionType transactionType = request.getTransactionRole().getTransactionType();
-        List<Charge> charges = depositService.getCharges(accountWrapper.account.getIdentifier(), transactionType);
-
-        // TODO add action and set the status to failed in separated transaction
-        InteropActionEntity action = addAction(transaction, request, transactionDate);
-        MoneyData fee = request.getFspFee();
-        action.setFee(fee == null ? null : fee.getAmount());
-        // TODO: extend Charge with a property that could be stored in charges
-
-        bookTransfer(request, accountWrapper, action, charges, transactionDate);
-
-        transactionRepository.save(transaction);
-
-        return InteropTransferResponseData.build(request.getTransferCode(), action.getState(), action.getExpirationDate(),
-                request.getExtensionList(), request.getTransferCode(), transactionDate);
-    }
-
-    Double getWithdrawableBalance(Account account, ProductDefinition productDefinition) {
-        // on-hold amount, if any, is subtracted to payable account
-        return MathUtil.subtractToZero(account.getBalance(), productDefinition.getMinimumBalance());
-    }
-
-    private void prepareTransfer(@NotNull InteropTransferCommand request, @NotNull AccountWrapper accountWrapper, @NotNull InteropActionEntity action,
-                                 List<Charge> charges, LocalDateTime transactionDate) {
-        BigDecimal amount = request.getAmount().getAmount();
-        // TODO: validate amount with quote amount
-        boolean isDebit = request.getTransactionRole().isWithdraw();
-        if (!isDebit)
-            return;
-
-        String prepareAccountId = action.getTransaction().getPrepareAccountIdentifier();
-        Account payableAccount = prepareAccountId == null ? null : validateAndGetAccount(request, prepareAccountId);
-        if (payableAccount == null) {
-            logger.warn("Can not prepare transfer: Payable account was not found for " + accountWrapper.account.getIdentifier());
-            return;
+        if (transferTotal.compareTo(calculatedTotal) != 0) {
+            throw new UnsupportedOperationException("Transfer amount+fee: "+transferTotal+" not matching with actual calculation: " + calculatedTotal);
         }
 
-        final JournalEntry journalEntry = createJournalEntry(action.getIdentifier(), TransactionType.CURRENCY_WITHDRAWAL.getCode(),
-                DateConverter.toIsoString(transactionDate), request.getNote(), getLoginUser());
+        LocalDateTime transactionDate = getNow();
+        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, getNow());
+        InteropActionEntity action = addAction(transaction, request, transactionDate);
+        action.setFee(calculatedFee);
+
+        if (request.getTransactionRole().isWithdraw()) {
+            Double withdrawableBalance = getWithdrawableBalance(accountWrapper.account, accountWrapper.productDefinition);
+            if(withdrawableBalance < calculatedTotal.doubleValue()) {
+                throw new UnsupportedOperationException("Not enough balance amount: " + withdrawableBalance + " < " + calculatedTotal.doubleValue());
+            }
+            prepareTransfer(request, accountWrapper, action, calculatedFee, transactionDate);
+        }
+
+        transactionRepository.save(transaction);
+
+        return InteropTransferResponseData.build(request.getTransactionCode(), action.getState(), action.getExpirationDate(),
+                request.getExtensionList(), request.getTransferCode(), transactionDate);
+    }
+
+    private void prepareTransfer(InteropTransferCommand request, AccountWrapper accountWrapper, InteropActionEntity action,
+                                 BigDecimal calculatedFee, LocalDateTime transactionDate) {
+        String accountId = accountWrapper.account.getIdentifier();
+        Account payableAccount = null;
+        try {
+            payableAccount = validateAndGetAccount(request, action.getTransaction().getPayableAccountIdentifier());
+        } catch (Exception ex) {
+            String msg = "Can not prepare transfer, payable account was not found for " + accountId + " to hold amount!";
+            logger.error(msg);
+            throw new UnsupportedOperationException(msg);
+        }
+
+        final JournalEntry journalEntry = createJournalEntry(action.getIdentifier(), CURRENCY_WITHDRAWAL.getCode(),
+                DateConverter.toIsoString(transactionDate), "withdraw-prepare", getLoginUser());
 
         HashSet<Debtor> debtors = new HashSet<>(1);
         HashSet<Creditor> creditors = new HashSet<>(1);
 
-        addCreditor(accountWrapper.account.getIdentifier(), amount.doubleValue(), creditors);
-        addDebtor(payableAccount.getIdentifier(), amount.doubleValue(), debtors);
+        BigDecimal amount = request.getAmount().getAmount();
+        addDebtor(accountId, amount.doubleValue(), debtors);
+        addCreditor(payableAccount.getIdentifier(), amount.doubleValue(), creditors);
 
-        prepareCharges(request, accountWrapper, action, charges, payableAccount, debtors, creditors);
-
-        if (debtors.isEmpty()) // must be same size as creditors
-            return;
+        if (calculatedFee.compareTo(ZERO) > 0) {
+            addDebtor(accountId, calculatedFee.doubleValue(), debtors);
+            addCreditor(payableAccount.getIdentifier(), calculatedFee.doubleValue(), creditors);
+        }
 
         journalEntry.setDebtors(debtors);
         journalEntry.setCreditors(creditors);
         accountingService.createJournalEntry(journalEntry);
     }
 
-    private void prepareCharges(@NotNull InteropTransferCommand request, @NotNull AccountWrapper accountWrapper, @NotNull InteropActionEntity action,
-                                @NotNull List<Charge> charges, Account payableAccount, HashSet<Debtor> debtors, HashSet<Creditor> creditors) {
-        MoneyData fspFee = request.getFspFee(); // TODO compare with calculated and with quote
+    @Transactional(propagation = Propagation.MANDATORY)
+    public InteropTransferResponseData commitTransfer(@NotNull InteropTransferCommand request) {
+        AccountWrapper accountWrapper = validateAndGetAccount(request);
+        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, getNow());
 
-        BigDecimal amount = request.getAmount().getAmount();
-        Currency currency = accountWrapper.productDefinition.getCurrency();
+        boolean isWithdraw = request.getTransactionRole().isWithdraw();
+        BigDecimal calculatedFee = ZERO;
+        List<Charge> charges = new ArrayList<>();
+        double preparedAmount = 0;
+        if(isWithdraw) {
+            TransactionType transactionType = request.getTransactionRole().getTransactionType();
+            BigDecimal transferAmount = request.getAmount().getAmount();
+            charges.addAll(depositService.getCharges(accountWrapper.account.getIdentifier(), transactionType));
+            calculatedFee = MathUtil.normalize(calcTotalCharges(charges, transferAmount), MathUtil.DEFAULT_MATH_CONTEXT);
 
-        BigDecimal total = MathUtil.normalize(calcTotalCharges(charges, amount), currency);
+            InteropActionEntity lastAction = getLastAction(transaction);
+            if (lastAction == null || !PREPARE.equals(lastAction.getActionType())) {
+                throw new UnsupportedOperationException("Can not commit amount, previous state invalid!");
+            }
 
-        if (MathUtil.isEmpty(total)) {
-            return;
+            JournalEntry prepareJournal = accountingService.findJournalEntry(lastAction.getIdentifier());
+            preparedAmount = prepareJournal.getCreditors().stream()
+                    .map(Creditor::getAmount)
+                    .mapToDouble(Double::parseDouble)
+                    .sum();
+
+            BigDecimal transferTotal = validateTransferAmount(request, accountWrapper);
+            if (transferTotal.compareTo(new BigDecimal(preparedAmount)) != 0) {
+                throw new UnsupportedOperationException("Transfer amount+fee: " + transferTotal + " not matching with prepared amount: " + preparedAmount);
+            }
         }
 
-        if (creditors == null) {
-            creditors = new HashSet<>(1);
-        }
-        if (debtors == null) {
-            debtors = new HashSet<>(charges.size());
-        }
-        addCreditor(accountWrapper.account.getIdentifier(), total.doubleValue(), creditors);
-        addDebtor(payableAccount.getIdentifier(), total.doubleValue(), debtors);
+        LocalDateTime transactionDate = getNow();
+        InteropActionEntity action = addAction(transaction, request, transactionDate);
+        action.setFee(calculatedFee);
+
+        bookTransfer(request, accountWrapper, action, charges, transactionDate, preparedAmount);
+
+        transactionRepository.save(transaction);
+        depositAccountManager.postProductInstanceCommand(accountWrapper.account.getIdentifier(), PRODUCT_INSTANCE_TRANSACTION);
+
+        return InteropTransferResponseData.build(request.getTransactionCode(), action.getState(), action.getExpirationDate(),
+                request.getExtensionList(), request.getTransferCode(), transactionDate);
     }
 
-    private void bookTransfer(@NotNull InteropTransferCommand request, @NotNull AccountWrapper accountWrapper, @NotNull InteropActionEntity action,
-                              List<Charge> charges, LocalDateTime transactionDate) {
-        boolean isDebit = request.getTransactionRole().isWithdraw();
-        String accountId = accountWrapper.account.getIdentifier();
-        String message = request.getNote();
-        double doubleAmount = request.getAmount().getAmount().doubleValue();
+    @Transactional(propagation = Propagation.MANDATORY)
+    public InteropTransferResponseData releaseTransfer(@NotNull InteropTransferCommand request) {
+        AccountWrapper accountWrapper = validateAndGetAccount(request);
+        InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, getNow());
+
+        InteropActionEntity lastAction = getLastAction(transaction);
+        if(lastAction == null || !(PREPARE.equals(lastAction.getActionType()) || RELEASE.equals(lastAction.getActionType()))) {
+            throw new UnsupportedOperationException("Can not release amount, previous state invalid!");
+        }
+        if(RELEASE.equals(lastAction.getActionType())) {
+            throw new UnsupportedOperationException("Amount already released!");
+        }
+
+        LocalDateTime transactionDate = getNow();
+        InteropActionEntity newAction = addAction(transaction, request, transactionDate);
+        newAction.setFee(ZERO);
+
+        String transactionId = transaction.getIdentifier();
+        JournalEntry prepareJournal = accountingService.findJournalEntry(lastAction.getIdentifier());
+
+        double preparedAmount = prepareJournal.getCreditors().stream()
+                .map(Creditor::getAmount)
+                .mapToDouble(Double::parseDouble)
+                .sum();
+        BigDecimal transferTotal = validateTransferAmount(request, accountWrapper);
+        if (transferTotal.compareTo(new BigDecimal(preparedAmount)) != 0) {
+            throw new UnsupportedOperationException("Transfer amount+fee: "+transferTotal+" not matching with prepared amount: " + preparedAmount);
+        }
 
         String loginUser = getLoginUser();
-        String transactionTypeCode = (isDebit ? TransactionType.CURRENCY_WITHDRAWAL : TransactionType.CURRENCY_DEPOSIT).getCode();
-        String transactionDateString = DateConverter.toIsoString(transactionDate);
+        final JournalEntry releaseJournal = createJournalEntry(RELEASE.name() + IDENTIFIER_SEPARATOR + transactionId,
+                REIMBURSEMENT.getCode(), DateConverter.toIsoString(transactionDate), "release", loginUser);
+        HashSet<Debtor> debtors = new HashSet<>(1);
+        HashSet<Creditor> creditors = new HashSet<>(1);
 
+        addDebtor(transaction.getPayableAccountIdentifier(), preparedAmount, debtors);
+        addCreditor(accountWrapper.account.getIdentifier(), preparedAmount, creditors);
+
+        releaseJournal.setDebtors(debtors);
+        releaseJournal.setCreditors(creditors);
+        accountingService.createJournalEntry(releaseJournal);
+        transactionRepository.save(transaction);
+
+        return InteropTransferResponseData.build(request.getTransactionCode(),
+                newAction.getState(),
+                newAction.getExpirationDate(),
+                request.getExtensionList(),
+                request.getTransferCode(),
+                transactionDate);
+    }
+
+    private Double getWithdrawableBalance(Account account, ProductDefinition productDefinition) {
+        // on-hold amount, if any, is subtracted to payable account
+        return MathUtil.subtractToZero(account.getBalance(), productDefinition.getMinimumBalance());
+    }
+
+    private void bookTransfer(InteropTransferCommand request, AccountWrapper accountWrapper, InteropActionEntity action,
+                              List<Charge> charges, LocalDateTime transactionDate, double preparedAmount) {
+        String transactionId = request.getIdentifier();
+        double transferAmount = request.getAmount().getAmount().doubleValue();
+        String loginUser = getLoginUser();
+        String transactionDateString = DateConverter.toIsoString(transactionDate);
         InteropTransactionEntity transaction = action.getTransaction();
-        Account nostroAccount = validateAndGetAccount(request, transaction.getNostroAccountIdentifier());
-        Account payableAccount = null;
 
-        double preparedAmount = 0d;
-        double accountNostroAmount = doubleAmount;
-
-        if (isDebit) {
-            InteropActionEntity prepareAction = findAction(transaction, InteropActionType.PREPARE);
-            if (prepareAction != null) {
-                JournalEntry prepareJournal = accountingService.findJournalEntry(prepareAction.getIdentifier());
-                if (prepareJournal == null)
-                    throw new UnsupportedOperationException("Can not find prepare result for " + action.getActionType() +
-                            "/" + request.getIdentifier());
-
-                payableAccount = validateAndGetAccount(request, transaction.getPrepareAccountIdentifier());
-                preparedAmount = prepareJournal.getDebtors().stream().mapToDouble(d -> Double.valueOf(d.getAmount())).sum();
-                if (preparedAmount < doubleAmount)
-                    throw new UnsupportedOperationException("Prepared amount " + preparedAmount + " is less than transfer amount " +
-                            doubleAmount + " for " + request.getIdentifier());
-
-                // now fails if prepared is not enough
-                accountNostroAmount = preparedAmount >= doubleAmount ? 0d : doubleAmount - preparedAmount;
-
-                double fromPrepareToNostroAmount = doubleAmount - accountNostroAmount;
-                preparedAmount -= fromPrepareToNostroAmount;
-
-                if (fromPrepareToNostroAmount > 0) {
-                    final JournalEntry fromPrepareToNostroEntry = createJournalEntry(action.getIdentifier(),
-                            transactionTypeCode, transactionDateString, message + " #commit", loginUser);
-
-                    HashSet<Debtor> debtors = new HashSet<>(1);
-                    HashSet<Creditor> creditors = new HashSet<>(1);
-
-                    addCreditor(payableAccount.getIdentifier(), fromPrepareToNostroAmount, creditors);
-                    addDebtor(nostroAccount.getIdentifier(), fromPrepareToNostroAmount, debtors);
-
-                    fromPrepareToNostroEntry.setDebtors(debtors);
-                    fromPrepareToNostroEntry.setCreditors(creditors);
-                    accountingService.createJournalEntry(fromPrepareToNostroEntry);
-                }
-            }
-        }
-        if (accountNostroAmount > 0) {
-            // can not happen that prepared amount is less than requested transfer amount (identifier and message can be default)
-            final JournalEntry journalEntry = createJournalEntry(action.getIdentifier(), transactionTypeCode,
-                    transactionDateString, message/* + (payableAccount == null ? "" : " #difference")*/, loginUser);
-
+        if (request.getTransactionRole().isWithdraw()) {
             HashSet<Debtor> debtors = new HashSet<>(1);
             HashSet<Creditor> creditors = new HashSet<>(1);
 
-            addCreditor(isDebit ? accountId : nostroAccount.getIdentifier(), accountNostroAmount, creditors);
-            addDebtor(isDebit ? nostroAccount.getIdentifier() : accountId, accountNostroAmount, debtors);
-
-            journalEntry.setDebtors(debtors);
-            journalEntry.setCreditors(creditors);
-            accountingService.createJournalEntry(journalEntry);
-        }
-
-        preparedAmount = bookCharges(request, accountWrapper, action, charges, payableAccount, preparedAmount, transactionDate);
-
-        if (preparedAmount > 0) {
-//            throw new UnsupportedOperationException("Prepared amount differs from transfer amount " + doubleAmount + " for " + request.getIdentifier());
-            // transfer back remaining prepared amount TODO: JM maybe fail this case?
-
-            final JournalEntry fromPrepareToAccountEntry = createJournalEntry(action.getIdentifier() + InteropRequestData.IDENTIFIER_SEPARATOR + "diff",
-                    transactionTypeCode, transactionDateString, message + " #release difference", loginUser);
-
-            HashSet<Debtor> debtors = new HashSet<>(1);
-            HashSet<Creditor> creditors = new HashSet<>(1);
-
-            addCreditor(payableAccount.getIdentifier(), preparedAmount, creditors);
-            addDebtor(accountId, preparedAmount, debtors);
-
-            fromPrepareToAccountEntry.setDebtors(debtors);
-            fromPrepareToAccountEntry.setCreditors(creditors);
-            accountingService.createJournalEntry(fromPrepareToAccountEntry);
-        }
-    }
-
-    private double bookCharges(@NotNull InteropTransferCommand request, @NotNull AccountWrapper accountWrapper, @NotNull InteropActionEntity action,
-                               @NotNull List<Charge> charges, Account payableAccount, double preparedAmount, LocalDateTime transactionDate) {
-        boolean isDebit = request.getTransactionRole().isWithdraw();
-        String accountId = accountWrapper.account.getIdentifier();
-        String message = request.getNote();
-        BigDecimal amount = request.getAmount().getAmount();
-        Currency currency = accountWrapper.productDefinition.getCurrency();
-
-        BigDecimal calcFee = MathUtil.normalize(calcTotalCharges(charges, amount), currency);
-        BigDecimal requestFee = request.getFspFee().getAmount();
-        if (!MathUtil.isEqualTo(calcFee, requestFee))
-            throw new UnsupportedOperationException("Quote fee " + requestFee + " differs from transfer fee " + calcFee);
-
-        if (MathUtil.isEmpty(calcFee)) {
-            return preparedAmount;
-        }
-
-        String loginUser = getLoginUser();
-        String transactionTypeCode = (isDebit ? TransactionType.CURRENCY_WITHDRAWAL : TransactionType.CURRENCY_DEPOSIT).getCode();
-        String transactionDateString = DateConverter.toIsoString(transactionDate);
-
-        ArrayList<Charge> unpaidCharges = new ArrayList<>(charges);
-        if (preparedAmount > 0) {
-            InteropActionEntity prepareAction = findAction(action.getTransaction(), InteropActionType.PREPARE);
-            if (prepareAction != null) {
-                final JournalEntry fromPrepareToRevenueEntry = createJournalEntry(action.getIdentifier() + InteropRequestData.IDENTIFIER_SEPARATOR + "fee",
-                        transactionTypeCode, transactionDateString, message + " #commit fee", loginUser);
-
-                double payedAmount = 0d;
-
-                HashSet<Debtor> debtors = new HashSet<>(1);
-                HashSet<Creditor> creditors = new HashSet<>(1);
-
-                for (Charge charge : charges) {
-                    BigDecimal value = calcChargeAmount(amount, charge, currency, true);
-                    if (value == null)
-                        continue;
-
-                    double doubleValue = value.doubleValue();
-                    if (doubleValue > preparedAmount) {
-                        break;
-                    }
-                    unpaidCharges.remove(charge);
-                    preparedAmount -= doubleValue;
-                    payedAmount += doubleValue;
-
-                    addDebtor(charge.getIncomeAccountIdentifier(), doubleValue, debtors);
-                }
-                if (!unpaidCharges.isEmpty())
-                    throw new UnsupportedOperationException("Prepared amount " + preparedAmount + " is less than transfer fee amount for " +
-                            request.getIdentifier());
-
-                if (payedAmount > 0) {
-                    addCreditor(payableAccount.getIdentifier(), payedAmount, creditors);
-
-                    fromPrepareToRevenueEntry.setDebtors(debtors);
-                    fromPrepareToRevenueEntry.setCreditors(creditors);
-                    accountingService.createJournalEntry(fromPrepareToRevenueEntry);
-                }
-            }
-        }
-        if (!unpaidCharges.isEmpty()) {
-            // can not happen that prepared amount is more or less than requested transfer amount (identifier and message can be default)
-            final JournalEntry journalEntry = createJournalEntry(action.getIdentifier() + InteropRequestData.IDENTIFIER_SEPARATOR + "fee",
-                    transactionTypeCode, transactionDateString, message + " #fee", loginUser);
-
-            HashSet<Debtor> debtors = new HashSet<>(1);
-            HashSet<Creditor> creditors = new HashSet<>(1);
-
-            double payedAmount = 0d;
+            Account payableAccount = validateAndGetAccount(request, transaction.getPayableAccountIdentifier());
+            double totalCharge = 0;
             for (Charge charge : charges) {
-                BigDecimal value = calcChargeAmount(amount, charge, currency, true);
-                if (value == null)
-                    continue;
-
-                double doubleValue = value.doubleValue();
-                payedAmount += doubleValue;
-
-                addDebtor(charge.getIncomeAccountIdentifier(), doubleValue, debtors);
+                BigDecimal chargeAmount = calcChargeAmount(action.getAmount(),
+                        charge, accountWrapper.productDefinition.getCurrency(),
+                        true);
+                if(chargeAmount.compareTo(ZERO) > 0) {
+                    totalCharge += chargeAmount.doubleValue();
+                    addDebtor(payableAccount.getIdentifier(), chargeAmount.doubleValue(), debtors);
+                    addCreditor(charge.getIncomeAccountIdentifier(), chargeAmount.doubleValue(), creditors);
+                }
             }
 
-            if (payedAmount > 0) {
-                addCreditor(accountId, payedAmount, creditors);
+            final JournalEntry withdrawJournal = createJournalEntry(action.getIdentifier() + IDENTIFIER_SEPARATOR + transactionId,
+                    CURRENCY_WITHDRAWAL.getCode(), transactionDateString, "withdraw-commit", loginUser);
 
-                journalEntry.setDebtors(debtors);
-                journalEntry.setCreditors(creditors);
-                accountingService.createJournalEntry(journalEntry);
-            }
+            // move from onhold to nostro
+            double finalAmount = preparedAmount - totalCharge;
+            addDebtor(payableAccount.getIdentifier(), finalAmount, debtors);
+            addCreditor(transaction.getNostroAccountIdentifier(), finalAmount, creditors);
+
+            withdrawJournal.setDebtors(debtors);
+            withdrawJournal.setCreditors(creditors);
+            accountingService.createJournalEntry(withdrawJournal);
+        } else { // deposit
+            final JournalEntry depositJournal = createJournalEntry(action.getIdentifier() + IDENTIFIER_SEPARATOR + transactionId,
+            CURRENCY_DEPOSIT.getCode(), transactionDateString, "deposit", loginUser);
+
+            HashSet<Debtor> debtors = new HashSet<>(1);
+            HashSet<Creditor> creditors = new HashSet<>(1);
+
+            // move from nostro to client account
+            addDebtor(transaction.getNostroAccountIdentifier(), transferAmount, debtors);
+            addCreditor(accountWrapper.account.getIdentifier(), transferAmount, creditors);
+
+            depositJournal.setDebtors(debtors);
+            depositJournal.setCreditors(creditors);
+            accountingService.createJournalEntry(depositJournal);
         }
-
-        return preparedAmount;
     }
-
-    // Util
 
     private JournalEntry createJournalEntry(String actionIdentifier, String transactionType, String transactionDate, String message, String loginUser) {
         final JournalEntry fromPrepareToNostroEntry = new JournalEntry();
@@ -562,7 +497,7 @@ public class InteropService {
     private BigDecimal calcChargeAmount(@NotNull BigDecimal amount, @NotNull Charge charge, Currency currency, boolean norm) {
         Double value = charge.getAmount();
         if (value == null)
-            return null;
+            return ZERO;
 
         BigDecimal portion = BigDecimal.valueOf(100.00d);
         MathContext mc = MathUtil.CALCULATION_MATH_CONTEXT;
@@ -575,7 +510,7 @@ public class InteropService {
 
     @NotNull
     private BigDecimal calcTotalCharges(@NotNull List<Charge> charges, BigDecimal amount) {
-        return charges.stream().map(charge -> calcChargeAmount(amount, charge)).reduce(MathUtil::add).orElse(BigDecimal.ZERO);
+        return charges.stream().map(charge -> calcChargeAmount(amount, charge)).reduce(MathUtil::add).orElse(ZERO);
     }
 
     private Account validateAndGetAccount(@NotNull String accountId) {
@@ -587,25 +522,15 @@ public class InteropService {
     }
 
     private AccountWrapper validateAndGetAccount(@NotNull InteropRequestData request) {
-        //TODO: error handling
         String accountId = request.getAccountId();
         Account account = accountingService.findAccount(accountId);
         validateAccount(request, account);
 
         ProductInstance product = depositService.findProductInstance(accountId);
         ProductDefinition productDefinition = depositService.findProductDefinition(product.getProductIdentifier());
+        request.normalizeAmounts(productDefinition.getCurrency());
 
-        Currency currency = productDefinition.getCurrency();
-        if (!currency.getCode().equals(request.getAmount().getCurrency()))
-            throw new UnsupportedOperationException();
-
-        request.normalizeAmounts(currency);
-
-        Double withdrawableBalance = getWithdrawableBalance(account, productDefinition);
-        if (request.getTransactionRole().isWithdraw() && withdrawableBalance < request.getAmount().getAmount().doubleValue())
-            throw new UnsupportedOperationException();
-
-        return new AccountWrapper(account, product, productDefinition, withdrawableBalance);
+        return new AccountWrapper(account, product, productDefinition, getWithdrawableBalance(account, productDefinition));
     }
 
     private Account validateAndGetPayableAccount(@NotNull InteropRequestData request, @NotNull AccountWrapper wrapper) {
@@ -662,30 +587,21 @@ public class InteropService {
         }
     }
 
-    private BigDecimal validateTransfer(@NotNull InteropTransferRequestData request, @NotNull AccountWrapper accountWrapper) {
-        BigDecimal amount = request.getAmount().getAmount();
+    private BigDecimal validateTransferAmount(InteropTransferRequestData request, AccountWrapper accountWrapper) {
+        String accountCurrency = accountWrapper.productDefinition.getCurrency().getCode();
 
-        boolean isDebit = request.getTransactionRole().isWithdraw();
-        Currency currency = accountWrapper.productDefinition.getCurrency();
+        MoneyData transferFee = request.getFspFee();
+        if (transferFee != null && !accountCurrency.equals(transferFee.getCurrency())) {
+            throw new UnsupportedOperationException("Transfer fee currency is invalid!");
+        }
+        MoneyData transferCommission = request.getFspCommission();
+        if (transferCommission != null && !accountCurrency.equals(transferCommission.getCurrency())) {
+            throw new UnsupportedOperationException("Transfer commission currency is invalid!");
+        }
 
-        BigDecimal total = isDebit ? amount : MathUtil.negate(amount);
-        MoneyData fspFee = request.getFspFee();
-        if (fspFee != null) {
-            if (!currency.getCode().equals(fspFee.getCurrency()))
-                throw new UnsupportedOperationException();
-            //TODO: compare with calculated quote fee
-            total = MathUtil.add(total, fspFee.getAmount());
-        }
-        MoneyData fspCommission = request.getFspCommission();
-        if (fspCommission != null) {
-            if (!currency.getCode().equals(fspCommission.getCurrency()))
-                throw new UnsupportedOperationException();
-            //TODO: compare with calculated quote commission
-            total = MathUtil.subtractToZero(total, fspCommission.getAmount());
-        }
-        if (isDebit && accountWrapper.withdrawableBalance < request.getAmount().getAmount().doubleValue())
-            throw new UnsupportedOperationException();
-        return total;
+        return request.getAmount().getAmount()
+                .add(transferFee == null ? ZERO : transferFee.getAmount())
+                .add(transferCommission == null ? ZERO : transferCommission.getAmount());
     }
 
     public List<Account> fetchAccounts(boolean includeClosed, String term, String type, boolean includeCustomerAccounts,
@@ -714,7 +630,7 @@ public class InteropService {
 
     @NotNull
     private String calcActionIdentifier(@NotNull String actionCode, @NotNull InteropActionType actionType) {
-        return actionType == InteropActionType.PREPARE || actionType == InteropActionType.COMMIT ? actionType + InteropRequestData.IDENTIFIER_SEPARATOR + actionCode : actionCode;
+        return (actionType == QUOTE || actionType == PREPARE || actionType == COMMIT || actionType == RELEASE) ? actionType + IDENTIFIER_SEPARATOR + actionCode : actionCode;
     }
 
     private InteropActionEntity validateAndGetAction(@NotNull String transactionCode, @NotNull String actionIdentifier, @NotNull InteropActionType actionType) {
@@ -737,39 +653,25 @@ public class InteropService {
         return action;
     }
 
-    @NotNull
-    private InteropTransactionEntity validateAndGetTransaction(@NotNull InteropRequestData request, @NotNull AccountWrapper accountWrapper) {
-        return validateAndGetTransaction(request, accountWrapper, true);
-    }
-
-    @NotNull
-    private InteropTransactionEntity validateAndGetTransaction(@NotNull InteropRequestData request, @NotNull AccountWrapper accountWrapper, boolean create) {
-        return validateAndGetTransaction(request, accountWrapper, getNow(), create);
-    }
-
-    @NotNull
-    private InteropTransactionEntity validateAndGetTransaction(@NotNull InteropRequestData request, @NotNull AccountWrapper accountWrapper,
-                                                               @NotNull LocalDateTime createdOn, boolean create) {
-        //TODO: error handling
-        String transactionCode = request.getTransactionCode();
+    private InteropTransactionEntity validateAndGetTransaction(InteropRequestData request, AccountWrapper accountWrapper, LocalDateTime createAt) {
         InteropTransactionEntity transaction = transactionRepository.findOneByIdentifier(request.getTransactionCode());
-        InteropState state = InteropStateMachine.handleTransition(transaction == null ? null : transaction.getState(), request.getActionType());
-        LocalDateTime now = getNow();
         if (transaction == null) {
-            if (!create)
-                throw new UnsupportedOperationException("Interperation transaction " + request.getTransactionCode() + " does not exist ");
-            transaction = new InteropTransactionEntity(transactionCode, accountWrapper.account.getIdentifier(), getLoginUser(), now);
+            transaction = new InteropTransactionEntity(request.getTransactionCode(),
+                    accountWrapper.account.getIdentifier(),
+                    getLoginUser(),
+                    createAt);
+            InteropState state = InteropStateMachine.handleTransition(null, request.getActionType());
             transaction.setState(state);
             transaction.setAmount(request.getAmount().getAmount());
             transaction.setName(request.getNote());
             transaction.setTransactionType(request.getTransactionRole().getTransactionType());
             Account payableAccount = validateAndGetPayableAccount(request, accountWrapper);
-            transaction.setPrepareAccountIdentifier(payableAccount == null ? null : payableAccount.getIdentifier());
+            transaction.setPayableAccountIdentifier(payableAccount == null ? null : payableAccount.getIdentifier());
             transaction.setNostroAccountIdentifier(validateAndGetNostroAccount(request).getIdentifier());
             transaction.setExpirationDate(request.getExpiration());
         }
         LocalDateTime expirationDate = transaction.getExpirationDate();
-        if (expirationDate != null && expirationDate.isBefore(now))
+        if (expirationDate != null && expirationDate.isBefore(createAt))
             throw new UnsupportedOperationException("Interperation transaction expired on " + expirationDate);
         return transaction;
     }
@@ -805,9 +707,9 @@ public class InteropService {
     }
 
     private InteropActionEntity getLastAction(InteropTransactionEntity transaction) {
-        List<InteropActionEntity> actions = transaction.getActions();
-        int size = actions.size();
-        return size == 0 ? null : actions.get(size - 1);
+        return transaction.getActions().stream()
+                .max(comparing(InteropActionEntity::getSeqNo))
+                .orElse(null);
     }
 
     private InteropActionEntity findAction(InteropTransactionEntity transaction, InteropActionType actionType) {
