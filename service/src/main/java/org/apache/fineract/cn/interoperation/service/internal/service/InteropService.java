@@ -77,7 +77,6 @@ import java.math.MathContext;
 import java.time.Clock;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 
@@ -90,11 +89,9 @@ import static org.apache.fineract.cn.interoperation.api.v1.domain.InteropActionT
 import static org.apache.fineract.cn.interoperation.api.v1.domain.InteropActionType.RELEASE;
 import static org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType.CURRENCY_DEPOSIT;
 import static org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType.CURRENCY_WITHDRAWAL;
-import static org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType.FEES_PAYMENT;
 import static org.apache.fineract.cn.interoperation.api.v1.domain.TransactionType.REIMBURSEMENT;
 import static org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropRequestData.IDENTIFIER_SEPARATOR;
 
-//import static org.apache.fineract.cn.interoperation.api.v1.util.InteroperationUtil.DEFAULT_ROUTING_CODE;
 
 @Service
 public class InteropService {
@@ -140,9 +137,12 @@ public class InteropService {
     @NotNull
     @Transactional(propagation = Propagation.MANDATORY)
     public InteropIdentifierData registerAccountIdentifier(@NotNull InteropIdentifierCommand request) {
-        //TODO: error handling
         String accountId = request.getAccountId();
-        validateAndGetAccount(accountId);
+        Account account = accountingService.findAccount(accountId);
+        if (account == null)
+            throw new UnsupportedOperationException("Account not found");
+        if (!account.getState().equals(Account.State.OPEN.name()))
+            throw new UnsupportedOperationException("Account is in state " + account.getState());
 
         String createdBy = getLoginUser();
         LocalDateTime createdOn = getNow();
@@ -183,7 +183,7 @@ public class InteropService {
     public InteropTransactionRequestResponseData createTransactionRequest(@NotNull InteropTransactionRequestData request) {
         // only when Payee request transaction from Payer, so here role must be always Payer
         //TODO: error handling
-        AccountWrapper accountWrapper = validateAndGetAccount(request);
+        AccountWrapper accountWrapper = validateAccount(request, accountingService.findAccount(request.getAccountId()));
         //TODO: transaction expiration separated from action expiration
         InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, getNow());
         InteropActionEntity action = addAction(transaction, request);
@@ -206,7 +206,7 @@ public class InteropService {
 
     @Transactional(propagation = Propagation.MANDATORY)
     public InteropQuoteResponseData createQuote(@NotNull InteropQuoteRequestData request) {
-        AccountWrapper accountWrapper = validateAndGetAccount(request);
+        AccountWrapper accountWrapper = validateAccount(request, accountingService.findAccount(request.getAccountId()));
         BigDecimal calculatedFee = ZERO;
 
         if(request.getTransactionRole().isWithdraw()) {
@@ -216,7 +216,7 @@ public class InteropService {
             calculatedFee = MathUtil.normalize(calcTotalCharges(charges, transferAmount), MathUtil.DEFAULT_MATH_CONTEXT);
             double calculatedTotal = transferAmount.add(calculatedFee).doubleValue();
 
-            Double withdrawableBalance = getWithdrawableBalance(accountWrapper.account, accountWrapper.productDefinition);
+            Double withdrawableBalance = accountWrapper.withdrawableBalance;
             if(withdrawableBalance < calculatedTotal) {
                 throw new UnsupportedOperationException("Not enough balance amount: " + withdrawableBalance + " < " + calculatedTotal);
             }
@@ -249,7 +249,7 @@ public class InteropService {
 
     @Transactional(propagation = Propagation.MANDATORY)
     public InteropTransferResponseData prepareTransfer(@NotNull InteropTransferCommand request) {
-        AccountWrapper accountWrapper = validateAndGetAccount(request);
+        AccountWrapper accountWrapper = validateAccount(request, accountingService.findAccount(request.getAccountId()));
         TransactionType transactionType = request.getTransactionRole().getTransactionType();
         BigDecimal transferAmount = request.getAmount().getAmount();
         List<Charge> charges = depositService.getCharges(accountWrapper.account.getIdentifier(), transactionType);
@@ -267,7 +267,7 @@ public class InteropService {
         action.setFee(calculatedFee);
 
         if (request.getTransactionRole().isWithdraw()) {
-            Double withdrawableBalance = getWithdrawableBalance(accountWrapper.account, accountWrapper.productDefinition);
+            Double withdrawableBalance = accountWrapper.withdrawableBalance;
             if(withdrawableBalance < calculatedTotal.doubleValue()) {
                 throw new UnsupportedOperationException("Not enough balance amount: " + withdrawableBalance + " < " + calculatedTotal.doubleValue());
             }
@@ -285,7 +285,7 @@ public class InteropService {
         String accountId = accountWrapper.account.getIdentifier();
         Account payableAccount = null;
         try {
-            payableAccount = validateAndGetAccount(request, action.getTransaction().getPayableAccountIdentifier());
+            payableAccount = validateAccount(request, accountingService.findAccount(action.getTransaction().getPayableAccountIdentifier())).account;
         } catch (Exception ex) {
             String msg = "Can not prepare transfer, payable account was not found for " + accountId + " to hold amount!";
             logger.error(msg);
@@ -314,7 +314,7 @@ public class InteropService {
 
     @Transactional(propagation = Propagation.MANDATORY)
     public InteropTransferResponseData commitTransfer(@NotNull InteropTransferCommand request) {
-        AccountWrapper accountWrapper = validateAndGetAccount(request);
+        AccountWrapper accountWrapper = validateAccount(request, accountingService.findAccount(request.getAccountId()));
         InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, getNow());
 
         boolean isWithdraw = request.getTransactionRole().isWithdraw();
@@ -359,7 +359,7 @@ public class InteropService {
 
     @Transactional(propagation = Propagation.MANDATORY)
     public InteropTransferResponseData releaseTransfer(@NotNull InteropTransferCommand request) {
-        AccountWrapper accountWrapper = validateAndGetAccount(request);
+        AccountWrapper accountWrapper = validateAccount(request, accountingService.findAccount(request.getAccountId()));
         InteropTransactionEntity transaction = validateAndGetTransaction(request, accountWrapper, getNow());
 
         InteropActionEntity lastAction = getLastAction(transaction);
@@ -425,7 +425,7 @@ public class InteropService {
             HashSet<Debtor> debtors = new HashSet<>(1);
             HashSet<Creditor> creditors = new HashSet<>(1);
 
-            Account payableAccount = validateAndGetAccount(request, transaction.getPayableAccountIdentifier());
+            Account payableAccount = validateAccount(request, accountingService.findAccount(transaction.getPayableAccountIdentifier())).account;
             double totalCharge = 0;
             for (Charge charge : charges) {
                 BigDecimal chargeAmount = calcChargeAmount(action.getAmount(),
@@ -513,78 +513,36 @@ public class InteropService {
         return charges.stream().map(charge -> calcChargeAmount(amount, charge)).reduce(MathUtil::add).orElse(ZERO);
     }
 
-    private Account validateAndGetAccount(@NotNull String accountId) {
-        //TODO: error handling
-        Account account = accountingService.findAccount(accountId);
-        validateAccount(account);
-
-        return account;
-    }
-
-    private AccountWrapper validateAndGetAccount(@NotNull InteropRequestData request) {
-        String accountId = request.getAccountId();
-        Account account = accountingService.findAccount(accountId);
-        validateAccount(request, account);
-
-        ProductInstance product = depositService.findProductInstance(accountId);
-        ProductDefinition productDefinition = depositService.findProductDefinition(product.getProductIdentifier());
-        request.normalizeAmounts(productDefinition.getCurrency());
-
-        return new AccountWrapper(account, product, productDefinition, getWithdrawableBalance(account, productDefinition));
-    }
-
-    private Account validateAndGetPayableAccount(@NotNull InteropRequestData request, @NotNull AccountWrapper wrapper) {
-        String referenceId = wrapper.account.getReferenceAccount();
-        if (referenceId == null)
-            return null;
-
-        return validateAndGetAccount(request, referenceId);
-    }
-
-    @NotNull
-    private Account validateAndGetNostroAccount(@NotNull InteropRequestData request) {
-        //TODO: error handling
-        List<Account> nostros = fetchAccounts(false, ACCOUNT_NAME_NOSTRO, AccountType.ASSET.name(), false, null, null, null, null);
-        int size = nostros.size();
-        if (size != 1)
-            throw new UnsupportedOperationException("NOSTRO Account " + (size == 0 ? "not found" : "is ambigous"));
-
-        Account nostro = nostros.get(0);
-        validateAccount(request, nostro);
-        return nostro;
-    }
-
-    @NotNull
-    private Account validateAndGetAccount(@NotNull InteropRequestData request, @NotNull String accountId) {
-        //TODO: error handling
-        Account account = accountingService.findAccount(accountId);
-
-        validateAccount(request, account);
-        return account;
-    }
-
-    private void validateAccount(Account account) {
-        if (account == null)
-            throw new UnsupportedOperationException("Account not found");
-        if (!account.getState().equals(Account.State.OPEN.name()))
+    private AccountWrapper validateAccount(InteropRequestData request, Account account) {
+        if (!account.getState().equals(Account.State.OPEN.name())) {
             throw new UnsupportedOperationException("Account is in state " + account.getState());
-    }
+        }
 
-    private void validateAccount(@NotNull InteropRequestData request, Account account) {
-        validateAccount(account);
-
-        String accountId = account.getIdentifier();
-
+        ProductDefinition productDefinition = null;
         if (account.getHolders() != null) { // customer account
-            ProductInstance product = depositService.findProductInstance(accountId);
-            ProductDefinition productDefinition = depositService.findProductDefinition(product.getProductIdentifier());
+            ProductInstance product = depositService.findProductInstance(account.getIdentifier());
+            productDefinition = depositService.findProductDefinition(product.getProductIdentifier());
             if (!Boolean.TRUE.equals(productDefinition.getActive()))
                 throw new UnsupportedOperationException("NOSTRO Product Definition is inactive");
 
-            Currency currency = productDefinition.getCurrency();
-            if (!currency.getCode().equals(request.getAmount().getCurrency()))
-                throw new UnsupportedOperationException();
+            if (!productDefinition.getCurrency().getCode().equals(request.getAmount().getCurrency())) {
+                throw new UnsupportedOperationException("Product definition and request has different currencies!");
+            }
+
+            request.normalizeAmounts(productDefinition.getCurrency());
         }
+
+        return new AccountWrapper(account, productDefinition, productDefinition == null ? 0 : getWithdrawableBalance(account, productDefinition));
+    }
+
+    @NotNull
+    private Account getNostroAccount() {
+        List<Account> nostros = fetchAccounts(false, ACCOUNT_NAME_NOSTRO, AccountType.ASSET.name(), false, null, null, null, null);
+        int size = nostros.size();
+        if (size != 1) {
+            throw new UnsupportedOperationException("NOSTRO Account " + (size == 0 ? "not found" : "is ambigous"));
+        }
+        return nostros.get(0);
     }
 
     private BigDecimal validateTransferAmount(InteropTransferRequestData request, AccountWrapper accountWrapper) {
@@ -665,9 +623,8 @@ public class InteropService {
             transaction.setAmount(request.getAmount().getAmount());
             transaction.setName(request.getNote());
             transaction.setTransactionType(request.getTransactionRole().getTransactionType());
-            Account payableAccount = validateAndGetPayableAccount(request, accountWrapper);
-            transaction.setPayableAccountIdentifier(payableAccount == null ? null : payableAccount.getIdentifier());
-            transaction.setNostroAccountIdentifier(validateAndGetNostroAccount(request).getIdentifier());
+            transaction.setPayableAccountIdentifier(validateAccount(request, accountingService.findAccount(accountWrapper.account.getReferenceAccount())).account.getIdentifier());
+            transaction.setNostroAccountIdentifier(validateAccount(request, getNostroAccount()).account.getIdentifier());
             transaction.setExpirationDate(request.getExpiration());
         }
         LocalDateTime expirationDate = transaction.getExpirationDate();
@@ -730,18 +687,18 @@ public class InteropService {
     }
 
     public static class AccountWrapper {
+
         @NotNull
         private final Account account;
-        @NotNull
-        private final ProductInstance product;
+
         @NotNull
         private final ProductDefinition productDefinition;
+
         @NotNull
         private final Double withdrawableBalance;
 
-        public AccountWrapper(Account account, ProductInstance product, ProductDefinition productDefinition, Double withdrawableBalance) {
+        public AccountWrapper(Account account, ProductDefinition productDefinition, Double withdrawableBalance) {
             this.account = account;
-            this.product = product;
             this.productDefinition = productDefinition;
             this.withdrawableBalance = withdrawableBalance;
         }
