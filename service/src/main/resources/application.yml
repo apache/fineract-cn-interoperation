@@ -16,10 +16,31 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+spring:
+  cloud:
+    discovery:
+      enabled: false
+    config:
+      enabled: false
+
+eureka:
+  client:
+    serviceUrl:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    homePageUrl: "http://${eureka.hostname}:2034/interoperation/v1/"
 
 server:
   port: 2034
   contextPath: /interoperation/v1/*
+
+postgresql:
+  driverClass: org.postgresql.Driver
+  database: seshat
+  host: localhost
+  port: 5432
+  user: postgres
+  password: postgres
 
 async:
   corePoolSize: 32
