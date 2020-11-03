@@ -30,7 +30,6 @@ import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransacti
 import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransactionRequestResponseData;
 import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransferCommand;
 import org.apache.fineract.cn.interoperation.api.v1.domain.data.InteropTransferResponseData;
-import org.apache.fineract.cn.interoperation.api.v1.domain.validation.InteroperationDataValidator;
 import org.apache.fineract.cn.interoperation.service.ServiceConstants;
 import org.apache.fineract.cn.interoperation.service.internal.service.InteropService;
 import org.slf4j.Logger;
@@ -45,17 +44,12 @@ import javax.validation.constraints.NotNull;
 public class InteropHandler {
 
     private final Logger logger;
-
-    private final InteroperationDataValidator dataValidator;
-
     private final InteropService interopService;
 
     @Autowired
     public InteropHandler(@Qualifier(ServiceConstants.LOGGER_NAME) final Logger logger,
-                          InteroperationDataValidator interoperationDataValidator,
                           InteropService interopService) {
         this.logger = logger;
-        this.dataValidator = interoperationDataValidator;
         this.interopService = interopService;
     }
 
@@ -63,7 +57,6 @@ public class InteropHandler {
     @Transactional
     @CommandHandler(logStart = CommandLogLevel.INFO, logFinish = CommandLogLevel.INFO)
     public InteropIdentifierData registerAccountIdentifier(@NotNull InteropIdentifierCommand command) {
-        command = dataValidator.registerAccountIdentifier(command);
         return interopService.registerAccountIdentifier(command);
     }
 
@@ -71,7 +64,6 @@ public class InteropHandler {
     @Transactional
     @CommandHandler(logStart = CommandLogLevel.INFO, logFinish = CommandLogLevel.INFO)
     public InteropIdentifierData deleteAccountIdentifier(@NotNull InteropIdentifierDeleteCommand command) {
-        command = dataValidator.deleteAccountIdentifier(command);
         return interopService.deleteAccountIdentifier(command);
     }
 
@@ -79,8 +71,6 @@ public class InteropHandler {
     @Transactional
     @CommandHandler(logStart = CommandLogLevel.INFO, logFinish = CommandLogLevel.INFO)
     public InteropTransactionRequestResponseData createTransactionRequest(@NotNull InteropTransactionRequestData command) {
-        // only when Payee request transaction from Payer, so here role must be always Payer
-        command = dataValidator.validateCreateRequest(command);
         return interopService.createTransactionRequest(command);
     }
 
@@ -88,7 +78,6 @@ public class InteropHandler {
     @Transactional
     @CommandHandler(logStart = CommandLogLevel.INFO, logFinish = CommandLogLevel.INFO)
     public InteropQuoteResponseData createQuote(@NotNull InteropQuoteRequestData command) {
-        command = dataValidator.validateCreateQuote(command);
         return interopService.createQuote(command);
     }
 
@@ -97,14 +86,12 @@ public class InteropHandler {
     @CommandHandler(logStart = CommandLogLevel.INFO, logFinish = CommandLogLevel.INFO)
     public InteropTransferResponseData performTransfer(@NotNull InteropTransferCommand command) {
         switch (command.getAction()) {
-            case PREPARE: {
-                command = dataValidator.validatePrepareTransfer(command);
+            case PREPARE:
                 return interopService.prepareTransfer(command);
-            }
-            case CREATE: {
-                command = dataValidator.validateCommitTransfer(command);
+            case CREATE:
                 return interopService.commitTransfer(command);
-            }
+            case RELEASE:
+                return interopService.releaseTransfer(command);
             default:
                 return null;
         }

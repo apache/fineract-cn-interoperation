@@ -64,7 +64,7 @@ public class MoneyData {
 
     public void normalizeAmount(@NotNull Currency currency) {
         if (!currency.getCode().equals(this.currency))
-            throw new UnsupportedOperationException("Internal error: Invalid currency " + currency.getCode());
+            throw new UnsupportedOperationException("Product and request has different currencies!");
         MathUtil.normalize(amount, currency);
     }
 

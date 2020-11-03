@@ -62,7 +62,7 @@ public class InteropTransactionEntity {
     private String customerAccountIdentifier;
 
     @Column(name = "payable_account_identifier", length = 32)
-    private String prepareAccountIdentifier;
+    private String payableAccountIdentifier;
 
     @Column(name = "nostro_account_identifier", nullable = false, length = 32)
     private String nostroAccountIdentifier;
@@ -109,7 +109,7 @@ public class InteropTransactionEntity {
         return id;
     }
 
-    private void setId(Long id) {
+    public void setId(Long id) {
         this.id = id;
     }
 
@@ -117,7 +117,7 @@ public class InteropTransactionEntity {
         return identifier;
     }
 
-    private void setIdentifier(String identifier) {
+    public void setIdentifier(String identifier) {
         this.identifier = identifier;
     }
 
@@ -169,12 +169,12 @@ public class InteropTransactionEntity {
         this.customerAccountIdentifier = customerAccountIdentifier;
     }
 
-    public String getPrepareAccountIdentifier() {
-        return prepareAccountIdentifier;
+    public String getPayableAccountIdentifier() {
+        return payableAccountIdentifier;
     }
 
-    public void setPrepareAccountIdentifier(String prepareAccountIdentifier) {
-        this.prepareAccountIdentifier = prepareAccountIdentifier;
+    public void setPayableAccountIdentifier(String payableAccountIdentifier) {
+        this.payableAccountIdentifier = payableAccountIdentifier;
     }
 
     public String getNostroAccountIdentifier() {
